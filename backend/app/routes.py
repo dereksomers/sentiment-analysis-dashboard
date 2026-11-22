@@ -1,13 +1,21 @@
+import csv
+import io
+import re
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
-from flask import Blueprint, abort, current_app, request
+from flask import Blueprint, abort, current_app, g, request, session as login_session
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
+from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.exceptions import BadRequest
 
-from .models import Dataset, SentimentResult, TextSample, Topic
+from .models import Dataset, SentimentResult, TextSample, Topic, User
 
 api = Blueprint("api", __name__, url_prefix="/api")
+EMAIL_PATTERN = re.compile(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+")
+CSV_MAX_BYTES = 5 * 1024 * 1024
+CSV_MAX_ROWS = 10_000
 
 
 def sessions():
@@ -46,6 +54,80 @@ def nonblank(value, name, max_length=None):
     return value
 
 
+def credentials():
+    data = fields(request.get_json(), ("email", "password"), ("email", "password"))
+    email = nonblank(data["email"], "email", 254).strip().lower()
+    if not EMAIL_PATTERN.fullmatch(email):
+        abort(400, "Enter a valid email address.")
+    password = data["password"]
+    if not isinstance(password, str) or not 12 <= len(password) <= 128:
+        abort(400, "Password must be 12–128 characters.")
+    try:
+        password.encode("utf-8")
+    except UnicodeEncodeError:
+        abort(400, "Password must contain valid Unicode characters.")
+    return email, password
+
+
+def public_user(user):
+    return {"id": user.id, "email": user.email}
+
+
+@api.before_request
+def load_user():
+    if request.endpoint in {"api.register", "api.login"}:
+        return
+    user_id = login_session.get("user_id")
+    if user_id is not None:
+        with sessions().begin() as session:
+            user = session.get(User, user_id)
+            if user is not None:
+                g.user = public_user(user)
+                return
+    login_session.clear()
+    abort(401, "Sign in to continue.")
+
+
+@api.after_request
+def prevent_caching(response):
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@api.post("/auth/register")
+def register():
+    email, password = credentials()
+    user = User(email=email, password_hash=generate_password_hash(password))
+    with sessions().begin() as session:
+        session.add(user)
+        session.flush()
+        return public_user(user), 201
+
+
+@api.post("/auth/login")
+def login():
+    email, password = credentials()
+    with sessions().begin() as session:
+        user = session.scalar(select(User).where(User.email == email))
+        if user is None or not check_password_hash(user.password_hash, password):
+            abort(401, "Invalid email or password.")
+        profile = public_user(user)
+    login_session.clear()
+    login_session["user_id"] = profile["id"]
+    return profile
+
+
+@api.delete("/auth/session")
+def logout():
+    login_session.clear()
+    return "", 204
+
+
+@api.get("/me")
+def me():
+    return g.user
+
+
 def sample_fields(data, creating=False):
     data = fields(data, ("text", "source_date"), ("text",) if creating else ()).copy()
     if "text" in data:
@@ -59,6 +141,45 @@ def sample_fields(data, creating=False):
             abort(400, "source_date must be YYYY-MM-DD or null.")
         data["source_date"] = parsed
     return data
+
+
+def csv_samples(upload):
+    content = upload.read(CSV_MAX_BYTES + 1)
+    if len(content) > CSV_MAX_BYTES:
+        abort(413, "CSV file must be at most 5 MiB.")
+    try:
+        decoded = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        abort(400, "CSV file must use UTF-8 encoding.")
+    if "\x00" in decoded:
+        abort(400, "CSV file must not contain null characters.")
+
+    reader = csv.DictReader(io.StringIO(decoded, newline=""), strict=True)
+    rows = []
+    try:
+        headers = reader.fieldnames or []
+        if (
+            "text" not in headers
+            or set(headers) - {"text", "source_date"}
+            or len(headers) != len(set(headers))
+        ):
+            abort(400, "CSV header must contain text and optionally source_date, once each.")
+        for row in reader:
+            if len(rows) >= CSV_MAX_ROWS:
+                abort(400, "CSV file must contain at most 10,000 data rows.")
+            if None in row or None in row.values():
+                abort(400, f"CSV line {reader.line_num} has a different column count from the header.")
+            if row.get("source_date") == "":
+                row["source_date"] = None
+            try:
+                rows.append(sample_fields(row, creating=True))
+            except BadRequest as error:
+                abort(400, f"CSV line {reader.line_num}: {error.description}")
+    except csv.Error:
+        abort(400, f"CSV parsing failed near line {reader.line_num}.")
+    if not rows:
+        abort(400, "CSV file must contain at least one data row.")
+    return rows
 
 
 def topic_fields(creating=False):
@@ -80,6 +201,17 @@ def topic_fields(creating=False):
 def find(session, model, row_id, dataset_id=None):
     row = session.get(model, row_id)
     if row is None or (dataset_id is not None and row.dataset_id != dataset_id):
+        abort(404, "Resource not found.")
+    return row
+
+
+def owned_datasets():
+    return select(Dataset).where(Dataset.owner_id == g.user["id"])
+
+
+def find_owned_dataset(session, dataset_id):
+    row = session.scalar(owned_datasets().where(Dataset.id == dataset_id))
+    if row is None:
         abort(404, "Resource not found.")
     return row
 
@@ -108,7 +240,7 @@ def create_dataset():
     data = fields(request.get_json(), ("name",), ("name",))
     name = nonblank(data["name"], "name", 200).strip()
     with sessions().begin() as session:
-        row = Dataset(name=name)
+        row = Dataset(name=name, owner_id=g.user["id"])
         session.add(row)
         session.flush()
         return serialize(row), 201
@@ -116,14 +248,14 @@ def create_dataset():
 
 @api.get("/datasets")
 def list_datasets():
-    with sessions() as session:
-        return page(session, select(Dataset), Dataset.id.desc())
+    with sessions().begin() as session:
+        return page(session, owned_datasets(), Dataset.id.desc())
 
 
 @api.route("/datasets/<int:dataset_id>", methods=["GET", "PATCH", "DELETE"])
 def dataset_detail(dataset_id):
     with sessions().begin() as session:
-        row = find(session, Dataset, dataset_id)
+        row = find_owned_dataset(session, dataset_id)
         if request.method == "DELETE":
             session.delete(row)
             return "", 204
@@ -136,7 +268,7 @@ def dataset_detail(dataset_id):
 @api.route("/datasets/<int:dataset_id>/samples", methods=["GET", "POST"])
 def samples(dataset_id):
     with sessions().begin() as session:
-        find(session, Dataset, dataset_id)
+        find_owned_dataset(session, dataset_id)
         if request.method == "POST":
             data = fields(request.get_json(), ("samples",), ("samples",))
             batch = data["samples"]
@@ -153,12 +285,27 @@ def samples(dataset_id):
         return page(session, query, TextSample.id)
 
 
+@api.post("/datasets/<int:dataset_id>/samples/import")
+def import_samples(dataset_id):
+    # Allow multipart framing in addition to the file's 5 MiB limit.
+    request.max_content_length = CSV_MAX_BYTES + 1024 * 1024
+    with sessions().begin() as session:
+        find_owned_dataset(session, dataset_id)
+        uploads = request.files.getlist("file")
+        if len(uploads) != 1 or not uploads[0].filename:
+            abort(400, "Upload one CSV file in the file form field.")
+        rows = csv_samples(uploads[0])
+        session.add_all(TextSample(dataset_id=dataset_id, **row) for row in rows)
+        return {"dataset_id": dataset_id, "created_count": len(rows)}, 201
+
+
 @api.route(
     "/datasets/<int:dataset_id>/samples/<int:sample_id>",
     methods=["GET", "PATCH", "DELETE"],
 )
 def sample_detail(dataset_id, sample_id):
     with sessions().begin() as session:
+        find_owned_dataset(session, dataset_id)
         row = find(session, TextSample, sample_id, dataset_id)
         if request.method == "DELETE":
             session.delete(row)
@@ -182,7 +329,7 @@ def sample_detail(dataset_id, sample_id):
 @api.route("/datasets/<int:dataset_id>/topics", methods=["GET", "POST"])
 def topics(dataset_id):
     with sessions().begin() as session:
-        find(session, Dataset, dataset_id)
+        find_owned_dataset(session, dataset_id)
         if request.method == "POST":
             row = Topic(dataset_id=dataset_id, **topic_fields(creating=True))
             session.add(row)
@@ -198,6 +345,7 @@ def topics(dataset_id):
 )
 def topic_detail(dataset_id, topic_id):
     with sessions().begin() as session:
+        find_owned_dataset(session, dataset_id)
         row = find(session, Topic, topic_id, dataset_id)
         if request.method == "DELETE":
             session.delete(row)
@@ -215,8 +363,8 @@ def topic_detail(dataset_id, topic_id):
 
 @api.get("/datasets/<int:dataset_id>/results")
 def list_results(dataset_id):
-    with sessions() as session:
-        find(session, Dataset, dataset_id)
+    with sessions().begin() as session:
+        find_owned_dataset(session, dataset_id)
         query = select(SentimentResult).where(SentimentResult.dataset_id == dataset_id)
         if "topic_id" in request.args:
             topic_id = request.args.get("topic_id", type=int)
@@ -229,13 +377,19 @@ def list_results(dataset_id):
 
 @api.get("/datasets/<int:dataset_id>/results/<int:result_id>")
 def result_detail(dataset_id, result_id):
-    with sessions() as session:
+    with sessions().begin() as session:
+        find_owned_dataset(session, dataset_id)
         return serialize(find(session, SentimentResult, result_id, dataset_id))
 
 
 @api.errorhandler(IntegrityError)
 def integrity_error(error):
     constraint = getattr(getattr(error.orig, "diag", None), "constraint_name", None)
+    if constraint == "uq_users_email":
+        return {"error": {
+            "code": "duplicate_email",
+            "message": "An account already uses that email address.",
+        }}, 409
     if constraint == "uq_topics_dataset_normalized_name":
         return {"error": {
             "code": "duplicate_topic",
